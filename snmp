@@ -1,34 +1,16 @@
 #!/usr/bin/env bash
-# install_and_run_snmp_discovery.sh
+# snmp (APT-only, no pip) - Installer + Runner
 #
-# Purpose:
-#   APT-only installer + runner for the RMM SNMP pre-deployment discovery script
-#   (generic_switch_snmp_predeploy_Updated_NoPip.py).
+# This file is intended to live in the GitHub repo as: 'snmp'
+# It installs dependencies via apt and runs the pinned Python discovery script.
 #
-# What it does:
-#   - Installs required dependencies via apt: python3-yaml python3-pysnmp4
-#   - Optionally installs SNMP CLI tools for quick connectivity tests: snmp
-#   - Optionally downloads IEEE oui.csv for MAC vendor lookup
-#   - Runs the discovery script with your provided arguments
+# Dependencies:
+#   sudo apt-get update
+#   sudo apt-get install -y python3-yaml python3-pysnmp4
 #
-# Usage examples:
-#   chmod +x install_and_run_snmp_discovery.sh
-#
-#   # Basic run (L2 switch + separate ARP source)
-#   ./install_and_run_snmp_discovery.sh \
-#     --switch 10.10.10.2 \
-#     --community 'PUBLIC' \
-#     --arp-host 10.10.10.1 \
-#     --oui-file ./oui.csv \
-#     --out-prefix Client_Site_2026-03-01
-#
-#   # Prompt for community (avoids putting it in shell history)
-#   ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --arp-host 10.10.10.1 --prompt-community
-#
-# Notes:
-#   - This script uses sudo for apt installs if you are not root.
-#   - The discovery script must be in the same directory, by default.
-#   - No pip is used. Everything is installed from Ubuntu repos via apt.
+# Usage:
+#   chmod +x snmp
+#   ./snmp --switch 10.10.10.2 --prompt-community --arp-host 10.10.10.1 --download-oui --out-prefix discovery_run
 
 set -euo pipefail
 
@@ -52,7 +34,7 @@ ARP_HOSTS=()
 
 print_help() {
   cat <<'EOF'
-install_and_run_snmp_discovery.sh (APT-only, no pip)
+snmp (APT-only, no pip) - Installer + Runner
 
 Required:
   --switch <IP_or_hostname>        SNMP management IP/hostname of the access switch
@@ -71,13 +53,6 @@ Optional:
   --classifier-yaml <path>         Optional keyword override YAML for classification
   --discovery-script <path>        Path to discovery .py file (default: ./generic_switch_snmp_predeploy_Updated_NoPip.py)
   -h, --help                       Show help
-
-Examples:
-  # Recommended (L2 switch + gateway ARP source)
-  ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --community 'PUBLIC' --arp-host 10.10.10.1 --download-oui --out-prefix Client_Site_2026-03-01
-
-  # Prompt community (avoids history)
-  ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --arp-host 10.10.10.1 --prompt-community --download-oui
 EOF
 }
 
@@ -128,7 +103,7 @@ fi
 
 if [[ ! -f "${DISCOVERY_SCRIPT}" ]]; then
   echo "ERROR: Discovery script not found at: ${DISCOVERY_SCRIPT}"
-  echo "Place generic_switch_snmp_predeploy_Updated_NoPip.py in the same folder as this script or pass --discovery-script <path>."
+  echo "Place the python script in the same folder or pass --discovery-script <path>."
   exit 1
 fi
 
@@ -138,7 +113,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
   else
-    echo "ERROR: This script needs root privileges for apt installs, but sudo is not available."
+    echo "ERROR: Root privileges needed for apt installs, but sudo is not available."
     echo "Run as root or install sudo."
     exit 1
   fi
@@ -160,7 +135,7 @@ if [[ "${DOWNLOAD_OUI}" == "true" ]]; then
   elif command -v wget >/dev/null 2>&1; then
     wget -O "${SCRIPT_DIR}/oui.csv" "https://standards-oui.ieee.org/oui/oui.csv"
   else
-    echo "ERROR: curl or wget is required to download oui.csv. Install one or provide --oui-file."
+    echo "ERROR: curl or wget required to download oui.csv. Install one or provide --oui-file."
     exit 1
   fi
   OUI_FILE="${SCRIPT_DIR}/oui.csv"

@@ -658,9 +658,9 @@ def main():
     print(f"Saved: {debug_csv}")
     print(f"Records: {len(rows)}")
     if not oui_map:
-        print("NOTE: Make is blank unless you provide --oui-file (IEEE oui.csv or Wireshark manuf).")
+        print("NOTE: Make is blank unless you provide --oui-file (IEEE oui.csv or Wireshark manuf)." )
     if not arp_host_used:
-        print("NOTE: No ARP source returned entries; IP fields may be blank. Provide --arp-host <gateway/core>.")
+        print("NOTE: No ARP source returned entries; IP fields may be blank. Provide --arp-host <gateway/core>." )
     print("Done.")
 
 if __name__ == "__main__":
