@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# install_and_run_snmp_discovery.sh
+#
+# Purpose:
+#   APT-only installer + runner for the RMM SNMP pre-deployment discovery script
+#   (generic_switch_snmp_predeploy_Updated_NoPip.py).
+#
+# What it does:
+#   - Installs required dependencies via apt: python3-yaml python3-pysnmp4
+#   - Optionally installs SNMP CLI tools for quick connectivity tests: snmp
+#   - Optionally downloads IEEE oui.csv for MAC vendor lookup
+#   - Runs the discovery script with your provided arguments
+#
+# Usage examples:
+#   chmod +x install_and_run_snmp_discovery.sh
+#
+#   # Basic run (L2 switch + separate ARP source)
+#   ./install_and_run_snmp_discovery.sh \
+#     --switch 10.10.10.2 \
+#     --community 'PUBLIC' \
+#     --arp-host 10.10.10.1 \
+#     --oui-file ./oui.csv \
+#     --out-prefix Client_Site_2026-03-01
+#
+#   # Prompt for community (avoids putting it in shell history)
+#   ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --arp-host 10.10.10.1 --prompt-community
+#
+# Notes:
+#   - This script uses sudo for apt installs if you are not root.
+#   - The discovery script must be in the same directory, by default.
+#   - No pip is used. Everything is installed from Ubuntu repos via apt.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISCOVERY_SCRIPT_DEFAULT="${SCRIPT_DIR}/generic_switch_snmp_predeploy_Updated_NoPip.py"
+
+SWITCH=""
+COMMUNITY=""
+PROMPT_COMMUNITY="false"
+OUT_PREFIX=""
+OUI_FILE=""
+DOWNLOAD_OUI="false"
+INSTALL_SNMP_TOOLS="false"
+RUN_TESTS="false"
+TIMEOUT="2.0"
+RETRIES="1"
+CLASSIFIER_YAML=""
+DISCOVERY_SCRIPT="${DISCOVERY_SCRIPT_DEFAULT}"
+
+ARP_HOSTS=()
+
+print_help() {
+  cat <<'EOF'
+install_and_run_snmp_discovery.sh (APT-only, no pip)
+
+Required:
+  --switch <IP_or_hostname>        SNMP management IP/hostname of the access switch
+  --community <string>             SNMP v2c read community (or use --prompt-community)
+
+Optional:
+  --prompt-community               Prompt for SNMP community (won't show in shell history)
+  --arp-host <IP_or_hostname>      ARP source SNMP target (gateway/core). Repeatable.
+  --out-prefix <name>              Output prefix (default: discovery_<timestamp>)
+  --oui-file <path>                Use existing OUI file (oui.csv) for Make lookup
+  --download-oui                   Download IEEE oui.csv into this folder (sets --oui-file automatically)
+  --install-snmp-tools             Install snmp CLI tools (snmpget/snmpwalk) for testing
+  --test                           Run quick SNMP tests before running discovery (requires snmp tools)
+  --timeout <seconds>              SNMP timeout (default 2.0)
+  --retries <n>                    SNMP retries (default 1)
+  --classifier-yaml <path>         Optional keyword override YAML for classification
+  --discovery-script <path>        Path to discovery .py file (default: ./generic_switch_snmp_predeploy_Updated_NoPip.py)
+  -h, --help                       Show help
+
+Examples:
+  # Recommended (L2 switch + gateway ARP source)
+  ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --community 'PUBLIC' --arp-host 10.10.10.1 --download-oui --out-prefix Client_Site_2026-03-01
+
+  # Prompt community (avoids history)
+  ./install_and_run_snmp_discovery.sh --switch 10.10.10.2 --arp-host 10.10.10.1 --prompt-community --download-oui
+EOF
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --switch) SWITCH="${2:-}"; shift 2;;
+    --community) COMMUNITY="${2:-}"; shift 2;;
+    --prompt-community) PROMPT_COMMUNITY="true"; shift 1;;
+    --arp-host) ARP_HOSTS+=("${2:-}"); shift 2;;
+    --out-prefix) OUT_PREFIX="${2:-}"; shift 2;;
+    --oui-file) OUI_FILE="${2:-}"; shift 2;;
+    --download-oui) DOWNLOAD_OUI="true"; shift 1;;
+    --install-snmp-tools) INSTALL_SNMP_TOOLS="true"; shift 1;;
+    --test) RUN_TESTS="true"; shift 1;;
+    --timeout) TIMEOUT="${2:-}"; shift 2;;
+    --retries) RETRIES="${2:-}"; shift 2;;
+    --classifier-yaml) CLASSIFIER_YAML="${2:-}"; shift 2;;
+    --discovery-script) DISCOVERY_SCRIPT="${2:-}"; shift 2;;
+    -h|--help) print_help; exit 0;;
+    *)
+      echo "Unknown option: $1"
+      echo
+      print_help
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${SWITCH}" ]]; then
+  echo "ERROR: --switch is required."
+  echo
+  print_help
+  exit 1
+fi
+
+if [[ "${PROMPT_COMMUNITY}" == "true" && -z "${COMMUNITY}" ]]; then
+  read -r -s -p "Enter SNMP community (hidden): " COMMUNITY
+  echo
+fi
+
+if [[ -z "${COMMUNITY}" ]]; then
+  echo "ERROR: --community is required (or use --prompt-community)."
+  echo
+  print_help
+  exit 1
+fi
+
+if [[ ! -f "${DISCOVERY_SCRIPT}" ]]; then
+  echo "ERROR: Discovery script not found at: ${DISCOVERY_SCRIPT}"
+  echo "Place generic_switch_snmp_predeploy_Updated_NoPip.py in the same folder as this script or pass --discovery-script <path>."
+  exit 1
+fi
+
+# Determine whether to use sudo
+SUDO=""
+if [[ "$(id -u)" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "ERROR: This script needs root privileges for apt installs, but sudo is not available."
+    echo "Run as root or install sudo."
+    exit 1
+  fi
+fi
+
+echo "==> Installing required dependencies (APT-only, no pip)..."
+${SUDO} apt-get update -y
+${SUDO} apt-get install -y python3-yaml python3-pysnmp4
+
+if [[ "${INSTALL_SNMP_TOOLS}" == "true" || "${RUN_TESTS}" == "true" ]]; then
+  echo "==> Installing SNMP CLI tools (snmpget/snmpwalk)..."
+  ${SUDO} apt-get install -y snmp
+fi
+
+if [[ "${DOWNLOAD_OUI}" == "true" ]]; then
+  echo "==> Downloading IEEE oui.csv to ${SCRIPT_DIR}/oui.csv ..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -L -o "${SCRIPT_DIR}/oui.csv" "https://standards-oui.ieee.org/oui/oui.csv"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "${SCRIPT_DIR}/oui.csv" "https://standards-oui.ieee.org/oui/oui.csv"
+  else
+    echo "ERROR: curl or wget is required to download oui.csv. Install one or provide --oui-file."
+    exit 1
+  fi
+  OUI_FILE="${SCRIPT_DIR}/oui.csv"
+fi
+
+if [[ "${RUN_TESTS}" == "true" ]]; then
+  if ! command -v snmpget >/dev/null 2>&1; then
+    echo "ERROR: snmp tools not installed. Re-run with --install-snmp-tools (or --test installs them too)."
+    exit 1
+  fi
+
+  echo "==> SNMP pre-checks (best-effort):"
+  echo "    - Testing sysDescr on switch: ${SWITCH}"
+  set +e
+  snmpget -v2c -c "${COMMUNITY}" "${SWITCH}" 1.3.6.1.2.1.1.1.0
+  echo "    - Testing MAC table walk (dot1d) on switch: ${SWITCH}"
+  snmpwalk -v2c -c "${COMMUNITY}" "${SWITCH}" 1.3.6.1.2.1.17.4.3.1.2 >/dev/null
+  TEST_RC=$?
+  set -e
+  if [[ ${TEST_RC} -ne 0 ]]; then
+    echo "WARNING: dot1d MAC table walk test returned non-zero. Script may fall back to dot1q, or SNMP may be blocked."
+  else
+    echo "    OK: SNMP basic checks succeeded."
+  fi
+fi
+
+echo "==> Running discovery script..."
+CMD=(python3 "${DISCOVERY_SCRIPT}" --switch "${SWITCH}" --community "${COMMUNITY}" --timeout "${TIMEOUT}" --retries "${RETRIES}")
+
+for ah in "${ARP_HOSTS[@]}"; do
+  [[ -n "${ah}" ]] && CMD+=(--arp-host "${ah}")
+done
+
+if [[ -n "${OUI_FILE}" ]]; then
+  CMD+=(--oui-file "${OUI_FILE}")
+fi
+
+if [[ -n "${CLASSIFIER_YAML}" ]]; then
+  CMD+=(--classifier-yaml "${CLASSIFIER_YAML}")
+fi
+
+if [[ -n "${OUT_PREFIX}" ]]; then
+  CMD+=(--out-prefix "${OUT_PREFIX}")
+fi
+
+echo "Command:"
+if [[ "${PROMPT_COMMUNITY}" == "true" ]]; then
+  echo "  python3 ${DISCOVERY_SCRIPT} --switch ${SWITCH} --community ******** --timeout ${TIMEOUT} --retries ${RETRIES} ..."
+else
+  printf '  %q ' "${CMD[@]}"; echo
+fi
+
+"${CMD[@]}"
+
+echo "==> Done."
+echo "Outputs are in: ${PWD}"
+ls -1 "${PWD}"/*_customer.csv "${PWD}"/*_debug.csv 2>/dev/null || true
