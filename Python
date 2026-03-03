@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""
+Generic Switch SNMP Pre-Deployment Discovery (Vendor-neutral) — APT install, no pip
+
+This script is designed for managed on-prem switches (unknown/neutral vendors included) and uses standard SNMP MIBs:
+- BRIDGE-MIB (dot1dTpFdbTable) for MAC table + port
+- Q-BRIDGE-MIB (dot1qTpFdbTable) fallback for VLAN-aware MAC table (when dot1d is empty)
+- IF-MIB for port names
+- IP-MIB for ARP table (to map IP↔MAC) from the best ARP source
+- LLDP-MIB for remote system name/description (often includes model)
+
+Outputs:
+- <prefix>_customer.csv (clean)
+- <prefix>_debug.csv (includes confidence/reason/source/VLAN/ARP host used)
+
+Dependencies (Ubuntu 24.04+ recommended approach):
+  sudo apt-get update
+  sudo apt-get install -y python3-yaml python3-pysnmp4
+
+Optional tools for testing (not required by the script):
+  sudo apt-get install -y snmp
+
+Notes:
+- pip is NOT required for this workflow.
+- You do NOT need to enable an SNMP server/agent on the machine running this script.
+  The script is an SNMP client and only needs outbound UDP/161 access to the switch/gateway.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import ipaddress
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Iterable, Any
+
+# ---- Friendly dependency checks (APT-first) ----
+try:
+    import yaml  # provided by python3-yaml
+except Exception:
+    print(
+        "\nERROR: Missing dependency 'yaml' (PyYAML).\n"
+        "Install with APT (recommended on Ubuntu 24.04+):\n"
+        "  sudo apt-get update\n"
+        "  sudo apt-get install -y python3-yaml\n",
+        file=sys.stderr
+    )
+    sys.exit(2)
+
+try:
+    from pysnmp.hlapi import (  # provided by python3-pysnmp4
+        SnmpEngine,
+        CommunityData,
+        UdpTransportTarget,
+        ContextData,
+        ObjectType,
+        ObjectIdentity,
+        nextCmd,
+    )
+except Exception:
+    print(
+        "\nERROR: Missing dependency 'pysnmp'.\n"
+        "Install with APT (recommended on Ubuntu 24.04+):\n"
+        "  sudo apt-get update\n"
+        "  sudo apt-get install -y python3-pysnmp4\n",
+        file=sys.stderr
+    )
+    sys.exit(2)
+
+# --------------------------
+# OIDs
+# --------------------------
+# BRIDGE-MIB (classic)
+OID_DOT1D_FDB_PORT   = "1.3.6.1.2.1.17.4.3.1.2"  # dot1dTpFdbPort
+OID_DOT1D_FDB_STATUS = "1.3.6.1.2.1.17.4.3.1.3"  # dot1dTpFdbStatus
+
+# Q-BRIDGE-MIB (VLAN-aware)
+OID_DOT1Q_FDB_PORT   = "1.3.6.1.2.1.17.7.1.2.2.1.2"  # dot1qTpFdbPort
+OID_DOT1Q_FDB_STATUS = "1.3.6.1.2.1.17.7.1.2.2.1.3"  # dot1qTpFdbStatus
+
+# Port mapping
+OID_BASEPORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"      # dot1dBasePortIfIndex
+OID_IFNAME           = "1.3.6.1.2.1.31.1.1.1.1"      # ifName
+OID_IFDESCR          = "1.3.6.1.2.1.2.2.1.2"         # ifDescr (fallback)
+
+# ARP table
+OID_IPNETTOMEDIA_PHYS = "1.3.6.1.2.1.4.22.1.2"       # ipNetToMediaPhysAddress
+
+# LLDP
+OID_LLDP_REM_CHASSIS_SUBTYPE = "1.0.8802.1.1.2.1.4.1.1.4"
+OID_LLDP_REM_CHASSIS_ID      = "1.0.8802.1.1.2.1.4.1.1.5"
+OID_LLDP_REM_SYSNAME         = "1.0.8802.1.1.2.1.4.1.1.9"
+OID_LLDP_REM_SYSDESC         = "1.0.8802.1.1.2.1.4.1.1.10"
+
+VALID_FDB_STATUSES = {3, 4, 5}  # learned/self/mgmt
+LLDP_CHASSIS_MAC_SUBTYPE = 4    # macAddress
+
+# --------------------------
+# Defaults: classification keywords
+# --------------------------
+DEFAULT_CLASSIFIER_YAML = """\
+av_keywords:
+  - biamp
+  - tesira
+  - qsc
+  - q-sys
+  - qsys
+  - crestron
+  - nvx
+  - extron
+  - barco
+  - christie
+  - epson
+  - panasonic
+  - sony
+  - lg
+  - samsung
+  - nec
+  - viewsonic
+  - shure
+  - sennheiser
+  - vaddio
+  - yealink
+  - poly
+  - plantronics
+  - logitech
+  - aver
+  - kramer
+  - atlona
+  - amx
+  - harman
+  - crown
+  - bss
+  - blackmagic
+  - bmd
+
+office_keywords:
+  - apple
+  - dell
+  - hp
+  - hewlett
+  - lenovo
+  - microsoft
+  - google
+  - amazon
+  - brother
+  - canon
+  - xerox
+  - zebra
+  - ricoh
+  - konica
+  - kyocera
+  - sharp
+
+network_keywords:
+  - cisco
+  - aruba
+  - hpe
+  - netgear
+  - ubiquiti
+  - juniper
+  - fortinet
+  - palo alto
+  - meraki
+  - ruckus
+  - extreme
+  - mikrotik
+  - d-link
+  - dlink
+  - tp-link
+  - tplink
+
+generic_chip_vendors:
+  - intel
+  - realtek
+  - broadcom
+  - qualcomm
+  - mediatek
+  - marvell
+  - microchip
+  - asix
+  - silicon labs
+  - silicon laboratories
+  - nvidia
+"""
+
+# --------------------------
+# Data models
+# --------------------------
+@dataclass
+class DeviceRow:
+    name: str
+    ip: str
+    mac: str
+    make: str
+    model: str
+    switchport: str
+    devicetype: str
+    confidence: str
+    reason: str
+    source: str
+    vlan: str
+    arp_host_used: str
+
+# --------------------------
+# Helpers
+# --------------------------
+def normalize_mac(mac: str) -> str:
+    h = re.sub(r"[^0-9a-fA-F]", "", (mac or "")).lower()
+    if len(h) != 12:
+        return (mac or "").lower()
+    return ":".join(h[i:i+2] for i in range(0, 12, 2))
+
+def mac_from_octets(octets: bytes) -> str:
+    if not octets or len(octets) < 6:
+        return ""
+    return ":".join(f"{b:02x}" for b in octets[:6])
+
+def safe_octets(val: Any) -> bytes:
+    try:
+        return bytes(val.asOctets())
+    except Exception:
+        pass
+    s = str(val).strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        s2 = re.sub(r"[^0-9a-fA-F]", "", s[2:])
+        try:
+            return bytes.fromhex(s2)
+        except Exception:
+            return b""
+    s2 = re.sub(r"[^0-9a-fA-F]", "", s)
+    if len(s2) >= 12:
+        try:
+            return bytes.fromhex(s2[:12])
+        except Exception:
+            return b""
+    return b""
+
+def oid_to_str(oid) -> str:
+    return ".".join(str(x) for x in oid)
+
+def snmp_walk(host: str, community: str, oid: str, timeout=2.0, retries=1) -> Iterable[Tuple[str, Any]]:
+    eng = SnmpEngine()
+    tgt = UdpTransportTarget((host, 161), timeout=timeout, retries=retries)
+    auth = CommunityData(community, mpModel=1)  # v2c
+    ctx = ContextData()
+    for (errInd, errStat, errIdx, varBinds) in nextCmd(
+        eng, auth, tgt, ctx, ObjectType(ObjectIdentity(oid)),
+        lexicographicMode=False,
+        ignoreNonIncreasingOid=True,
+        maxRepetitions=25
+    ):
+        if errInd:
+            raise RuntimeError(f"{host} SNMP walk error: {errInd}")
+        if errStat:
+            raise RuntimeError(f"{host} SNMP walk errorStatus={errStat.prettyPrint()} at {errIdx}")
+        for name, val in varBinds:
+            yield (oid_to_str(name), val)
+
+# --------------------------
+# OUI lookup
+# --------------------------
+def load_oui_map(path: Optional[Path]) -> Dict[str, str]:
+    """
+    Supports:
+      - IEEE oui.csv (Assignment, Organization Name, ...)
+      - Wireshark manuf file
+    Returns: dict OUI(6 hex) -> vendor
+    """
+    if not path or not path.exists():
+        return {}
+
+    m: Dict[str, str] = {}
+    if path.suffix.lower() == ".csv":
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                assign = (row.get("Assignment") or row.get("assignment") or "").strip()
+                org = (row.get("Organization Name") or row.get("Organization") or "").strip()
+                if not assign or not org:
+                    continue
+                key = re.sub(r"[^0-9A-Fa-f]", "", assign).lower()
+                if len(key) >= 6:
+                    m[key[:6]] = org
+    else:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = re.split(r"\s+", line, maxsplit=1)
+                if len(parts) < 2:
+                    continue
+                prefix, vendor = parts[0], parts[1].strip()
+                key = re.sub(r"[^0-9A-Fa-f]", "", prefix).lower()
+                if len(key) >= 6:
+                    m[key[:6]] = vendor
+    return m
+
+def vendor_from_mac(oui_map: Dict[str, str], mac: str) -> str:
+    mac_n = normalize_mac(mac)
+    key = mac_n.replace(":", "")[:6].lower()
+    return (oui_map.get(key, "") or "").strip()
+
+# --------------------------
+# Classification
+# --------------------------
+def load_classifier(path: Optional[Path]) -> dict:
+    base = yaml.safe_load(DEFAULT_CLASSIFIER_YAML)
+    if path and path.exists():
+        override = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for k in ["av_keywords", "office_keywords", "network_keywords", "generic_chip_vendors"]:
+            if k in override and isinstance(override[k], list):
+                base[k] = override[k]
+    return base
+
+def count_hits(text: str, keywords: List[str]) -> int:
+    t = (text or "").lower()
+    return sum(1 for k in keywords if k and str(k).lower() in t)
+
+def classify_device(make: str, model: str, name: str, cfg: dict) -> Tuple[str, str, str]:
+    blob = f"{make or ''} {model or ''} {name or ''}".lower()
+    make_l = (make or "").lower()
+
+    av_hits = count_hits(blob, cfg.get("av_keywords", []))
+    off_hits = count_hits(blob, cfg.get("office_keywords", []))
+    net_hits = count_hits(blob, cfg.get("network_keywords", []))
+
+    av_score = av_hits * 3
+    off_score = off_hits * 3
+    net_score = net_hits * 2
+
+    if (make or "").strip():
+        if av_hits: av_score += 1
+        if off_hits: off_score += 1
+        if net_hits: net_score += 1
+
+    if any(g in make_l for g in cfg.get("generic_chip_vendors", [])):
+        av_score = max(0, av_score - 1)
+        off_score = max(0, off_score - 1)
+        net_score = max(0, net_score - 1)
+
+    scores = {"AV": av_score, "Consumer/Office": off_score, "Network/IT": net_score}
+    best_type = max(scores, key=scores.get)
+    best_score = scores[best_type]
+
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if best_score == 0 or (sorted_scores[0][1] == sorted_scores[1][1] and sorted_scores[0][1] != 0):
+        return "Unknown", "Low", f"No strong signal (scores={scores})"
+
+    if best_score >= 6:
+        conf = "High"
+    elif best_score >= 3:
+        conf = "Medium"
+    else:
+        conf = "Low"
+
+    reason = f"{best_type} chosen (scores={scores}, make='{make}', av_hits={av_hits}, office_hits={off_hits}, net_hits={net_hits})"
+    return best_type, conf, reason
+
+# --------------------------
+# SNMP collectors
+# --------------------------
+def parse_dot1d_mac_from_oid(oid: str, base: str) -> Optional[str]:
+    if not oid.startswith(base + "."):
+        return None
+    parts = oid[len(base) + 1:].split(".")
+    if len(parts) < 6:
+        return None
+    try:
+        mac_bytes = [int(x) for x in parts[-6:]]
+        mac = ":".join(f"{b:02x}" for b in mac_bytes)
+        return normalize_mac(mac)
+    except Exception:
+        return None
+
+def parse_dot1q_vlan_mac_from_oid(oid: str, base: str) -> Optional[Tuple[int, str]]:
+    if not oid.startswith(base + "."):
+        return None
+    parts = oid[len(base) + 1:].split(".")
+    if len(parts) < 7:
+        return None
+    try:
+        vlan = int(parts[0])
+        mac_bytes = [int(x) for x in parts[1:7]]
+        mac = ":".join(f"{b:02x}" for b in mac_bytes)
+        return vlan, normalize_mac(mac)
+    except Exception:
+        return None
+
+def collect_fdb_dot1d(host: str, community: str, timeout: float, retries: int) -> Dict[str, Tuple[int, str]]:
+    port: Dict[str, int] = {}
+    status: Dict[str, int] = {}
+
+    for oid, val in snmp_walk(host, community, OID_DOT1D_FDB_PORT, timeout=timeout, retries=retries):
+        mac = parse_dot1d_mac_from_oid(oid, OID_DOT1D_FDB_PORT)
+        if mac:
+            try:
+                port[mac] = int(val)
+            except Exception:
+                pass
+
+    for oid, val in snmp_walk(host, community, OID_DOT1D_FDB_STATUS, timeout=timeout, retries=retries):
+        mac = parse_dot1d_mac_from_oid(oid, OID_DOT1D_FDB_STATUS)
+        if mac:
+            try:
+                status[mac] = int(val)
+            except Exception:
+                pass
+
+    out: Dict[str, Tuple[int, str]] = {}
+    for mac, bp in port.items():
+        if status.get(mac, 0) in VALID_FDB_STATUSES:
+            out[mac] = (bp, "")
+    return out
+
+def collect_fdb_dot1q(host: str, community: str, timeout: float, retries: int) -> Dict[str, Tuple[int, str]]:
+    port: Dict[Tuple[int, str], int] = {}
+    status: Dict[Tuple[int, str], int] = {}
+
+    for oid, val in snmp_walk(host, community, OID_DOT1Q_FDB_PORT, timeout=timeout, retries=retries):
+        parsed = parse_dot1q_vlan_mac_from_oid(oid, OID_DOT1Q_FDB_PORT)
+        if parsed:
+            vlan, mac = parsed
+            try:
+                port[(vlan, mac)] = int(val)
+            except Exception:
+                pass
+
+    for oid, val in snmp_walk(host, community, OID_DOT1Q_FDB_STATUS, timeout=timeout, retries=retries):
+        parsed = parse_dot1q_vlan_mac_from_oid(oid, OID_DOT1Q_FDB_STATUS)
+        if parsed:
+            vlan, mac = parsed
+            try:
+                status[(vlan, mac)] = int(val)
+            except Exception:
+                pass
+
+    out: Dict[str, Tuple[int, str]] = {}
+    for (vlan, mac), bp in port.items():
+        st = status.get((vlan, mac), 0)
+        if st in VALID_FDB_STATUSES and mac not in out:
+            out[mac] = (bp, str(vlan))
+
+    if not out and port:
+        for (vlan, mac), bp in port.items():
+            if mac not in out:
+                out[mac] = (bp, str(vlan))
+
+    return out
+
+def collect_ports(host: str, community: str, timeout: float, retries: int) -> Dict[int, str]:
+    b2i: Dict[int, int] = {}
+    for oid, val in snmp_walk(host, community, OID_BASEPORT_IFINDEX, timeout=timeout, retries=retries):
+        try:
+            bport = int(oid.split(".")[-1])
+            b2i[bport] = int(val)
+        except Exception:
+            pass
+
+    i2n: Dict[int, str] = {}
+    try:
+        for oid, val in snmp_walk(host, community, OID_IFNAME, timeout=timeout, retries=retries):
+            i2n[int(oid.split(".")[-1])] = str(val)
+    except Exception:
+        i2n = {}
+
+    if not i2n:
+        for oid, val in snmp_walk(host, community, OID_IFDESCR, timeout=timeout, retries=retries):
+            try:
+                i2n[int(oid.split(".")[-1])] = str(val)
+            except Exception:
+                pass
+
+    return {bp: i2n.get(ix, f"bridgePort{bp}") for bp, ix in b2i.items()}
+
+def collect_arp(host: str, community: str, timeout: float, retries: int) -> Dict[str, List[str]]:
+    mac_to_ips: Dict[str, List[str]] = {}
+    for oid, val in snmp_walk(host, community, OID_IPNETTOMEDIA_PHYS, timeout=timeout, retries=retries):
+        ip = ".".join(oid.split(".")[-4:])
+        try:
+            ipaddress.ip_address(ip)
+        except Exception:
+            continue
+        mac = normalize_mac(mac_from_octets(safe_octets(val)) or str(val))
+        if not mac:
+            continue
+        mac_to_ips.setdefault(mac, [])
+        if ip not in mac_to_ips[mac]:
+            mac_to_ips[mac].append(ip)
+    return mac_to_ips
+
+def collect_lldp(host: str, community: str, timeout: float, retries: int) -> Dict[str, Dict[str, str]]:
+    subtype: Dict[str, int] = {}
+    chassis: Dict[str, str] = {}
+    sysname: Dict[str, str] = {}
+    sysdesc: Dict[str, str] = {}
+
+    def idx_key(oid_str: str, base: str) -> Optional[str]:
+        if not oid_str.startswith(base + "."):
+            return None
+        parts = oid_str.split(".")
+        return ".".join(parts[-3:]) if len(parts) >= 3 else None
+
+    for oid, val in snmp_walk(host, community, OID_LLDP_REM_CHASSIS_SUBTYPE, timeout=timeout, retries=retries):
+        k = idx_key(oid, OID_LLDP_REM_CHASSIS_SUBTYPE)
+        if k:
+            try:
+                subtype[k] = int(val)
+            except Exception:
+                pass
+
+    for oid, val in snmp_walk(host, community, OID_LLDP_REM_CHASSIS_ID, timeout=timeout, retries=retries):
+        k = idx_key(oid, OID_LLDP_REM_CHASSIS_ID)
+        if k:
+            mac = mac_from_octets(safe_octets(val))
+            chassis[k] = normalize_mac(mac) if mac else normalize_mac(str(val))
+
+    for oid, val in snmp_walk(host, community, OID_LLDP_REM_SYSNAME, timeout=timeout, retries=retries):
+        k = idx_key(oid, OID_LLDP_REM_SYSNAME)
+        if k:
+            sysname[k] = str(val)
+
+    for oid, val in snmp_walk(host, community, OID_LLDP_REM_SYSDESC, timeout=timeout, retries=retries):
+        k = idx_key(oid, OID_LLDP_REM_SYSDESC)
+        if k:
+            sysdesc[k] = str(val)
+
+    out: Dict[str, Dict[str, str]] = {}
+    for k, st in subtype.items():
+        if st != LLDP_CHASSIS_MAC_SUBTYPE:
+            continue
+        mac = chassis.get(k, "")
+        if mac:
+            out[mac] = {"name": sysname.get(k, ""), "model": sysdesc.get(k, "")}
+    return out
+
+# --------------------------
+# ARP host selection
+# --------------------------
+def pick_best_arp_source(community: str, hosts: List[str], timeout: float, retries: int) -> Tuple[str, Dict[str, List[str]]]:
+    best_host = ""
+    best_map: Dict[str, List[str]] = {}
+    best_count = -1
+
+    for h in hosts:
+        try:
+            m = collect_arp(h, community, timeout=timeout, retries=retries)
+            count = sum(len(v) for v in m.values())
+            if count > best_count:
+                best_count = count
+                best_host = h
+                best_map = m
+        except Exception:
+            continue
+
+    return best_host, best_map
+
+# --------------------------
+# Main
+# --------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Generic SNMP pre-deployment discovery (vendor-neutral) — APT install, no pip")
+    ap.add_argument("--switch", required=True, help="SNMP IP/hostname of the access switch")
+    ap.add_argument("--community", required=True, help="SNMP v2c read community string")
+    ap.add_argument("--arp-host", action="append", default=[], help="SNMP IP/hostname(s) likely to have ARP (L3 gateway/router/core). Repeatable.")
+    ap.add_argument("--oui-file", default="", help="Optional: path to IEEE oui.csv (or Wireshark manuf) to fill Make")
+    ap.add_argument("--classifier-yaml", default="", help="Optional: YAML keyword overrides for classification")
+    ap.add_argument("--timeout", type=float, default=2.0, help="SNMP timeout seconds (default 2.0)")
+    ap.add_argument("--retries", type=int, default=1, help="SNMP retries (default 1)")
+    ap.add_argument("--out-prefix", default="", help="Output prefix (default discovery_<timestamp>)")
+    args = ap.parse_args()
+
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_prefix = args.out_prefix or f"discovery_{ts}"
+
+    oui_map = load_oui_map(Path(args.oui_file)) if args.oui_file else {}
+    classifier = load_classifier(Path(args.classifier_yaml) if args.classifier_yaml else None)
+
+    # 1) FDB: dot1d then dot1q fallback
+    fdb: Dict[str, Tuple[int, str]] = {}
+    fdb_source = ""
+    try:
+        fdb = collect_fdb_dot1d(args.switch, args.community, timeout=args.timeout, retries=args.retries)
+        fdb_source = "dot1d"
+    except Exception:
+        fdb = {}
+    if not fdb:
+        fdb = collect_fdb_dot1q(args.switch, args.community, timeout=args.timeout, retries=args.retries)
+        fdb_source = "dot1q"
+
+    # 2) Port names
+    ports = collect_ports(args.switch, args.community, timeout=args.timeout, retries=args.retries)
+
+    # 3) LLDP best-effort
+    try:
+        lldp = collect_lldp(args.switch, args.community, timeout=args.timeout, retries=args.retries)
+    except Exception:
+        lldp = {}
+
+    # 4) ARP best source: try switch + provided candidates
+    arp_candidates = [args.switch] + [h for h in (args.arp_host or []) if h and h != args.switch]
+    arp_host_used, arp_map = pick_best_arp_source(args.community, arp_candidates, timeout=args.timeout, retries=args.retries)
+
+    rows: List[DeviceRow] = []
+    for mac, (bport, vlan) in sorted(fdb.items(), key=lambda x: x[0]):
+        ip = (arp_map.get(mac) or [""])[0]
+        l = lldp.get(mac, {})
+        name = (l.get("name", "") or "").strip()
+        model = (l.get("model", "") or "").strip()
+        make = vendor_from_mac(oui_map, mac) if oui_map else ""
+
+        devtype, conf, reason = classify_device(make, model, name, classifier)
+
+        src_parts = [f"SNMP(FDB:{fdb_source})"]
+        src_parts.append("LLDP" if (name or model) else "LLDP:none")
+        src_parts.append(f"ARP@{arp_host_used}" if arp_host_used else "ARP:none")
+        source = "+".join(src_parts)
+
+        rows.append(DeviceRow(
+            name=name,
+            ip=ip,
+            mac=mac,
+            make=make,
+            model=model,
+            switchport=ports.get(bport, str(bport)),
+            devicetype=devtype,
+            confidence=conf,
+            reason=reason,
+            source=source,
+            vlan=vlan,
+            arp_host_used=arp_host_used,
+        ))
+
+    # 5) Write outputs
+    customer_csv = f"{out_prefix}_customer.csv"
+    debug_csv = f"{out_prefix}_debug.csv"
+
+    with open(customer_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Name", "IP address", "MAC address", "Make", "Model", "SwitchPort", "DeviceType"])
+        for r in rows:
+            w.writerow([r.name, r.ip, r.mac, r.make, r.model, r.switchport, r.devicetype])
+
+    with open(debug_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Name", "IP address", "MAC address", "Make", "Model", "SwitchPort", "DeviceType",
+                    "Confidence", "Reason", "Source", "VLAN", "ARPHostUsed"])
+        for r in rows:
+            w.writerow([r.name, r.ip, r.mac, r.make, r.model, r.switchport, r.devicetype,
+                        r.confidence, r.reason, r.source, r.vlan, r.arp_host_used])
+
+    print(f"Saved: {customer_csv}")
+    print(f"Saved: {debug_csv}")
+    print(f"Records: {len(rows)}")
+    if not oui_map:
+        print("NOTE: Make is blank unless you provide --oui-file (IEEE oui.csv or Wireshark manuf).")
+    if not arp_host_used:
+        print("NOTE: No ARP source returned entries; IP fields may be blank. Provide --arp-host <gateway/core>.")
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
